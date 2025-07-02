@@ -1,0 +1,31 @@
+{
+  "default_settings": {
+    "target_size_mb": 45,
+    "quality_preset": "medium",
+    "audio_bitrate": "128k",
+    "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"],
+    "output_format": "mp4"
+  },
+  "profiles": {
+    "discord": {
+      "target_size_mb": 45,
+      "quality_preset": "medium",
+      "description": "Discord用（50MB制限対応）"
+    },
+    "twitter": {
+      "target_size_mb": 500,
+      "quality_preset": "slow",
+      "description": "Twitter用（512MB制限対応）"
+    },
+    "instagram": {
+      "target_size_mb": 100,
+      "quality_preset": "slow",
+      "description": "Instagram用（100MB制限対応）"
+    },
+    "youtube_preview": {
+      "target_size_mb": 20,
+      "quality_preset": "fast",
+      "description": "YouTube プレビュー用（高速圧縮）"
+    }
+  }
+} 

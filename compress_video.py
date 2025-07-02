@@ -13,17 +13,96 @@ import shutil
 from pathlib import Path
 import json
 import re
+import time
+import threading
 
 class Colors:
     RED = '\033[0;31m'
     GREEN = '\033[0;32m'
     YELLOW = '\033[1;33m'
     BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    MAGENTA = '\033[0;35m'
     NC = '\033[0m'  # No Color
 
+class ProgressBar:
+    def __init__(self, total_duration):
+        self.total_duration = total_duration
+        self.current_time = 0
+        self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self.spinner_index = 0
+        self.is_running = True
+        
+    def update_progress(self, current_time):
+        self.current_time = current_time
+        
+    def draw_progress_bar(self, progress, width=40):
+        filled = int(width * progress / 100)
+        bar = "█" * filled + "▒" * (width - filled)
+        return f"[{bar}]"
+        
+    def animate_spinner(self):
+        while self.is_running:
+            progress = min(self.current_time / self.total_duration * 100, 100) if self.total_duration > 0 else 0
+            spinner = self.spinner_chars[self.spinner_index % len(self.spinner_chars)]
+            progress_bar = self.draw_progress_bar(progress)
+            
+            elapsed_mins = int(self.current_time // 60)
+            elapsed_secs = int(self.current_time % 60)
+            
+            print(f"\r{Colors.CYAN}{spinner}{Colors.NC} {progress_bar} {progress:.1f}% "
+                  f"({elapsed_mins:02d}:{elapsed_secs:02d})", end='', flush=True)
+            
+            self.spinner_index += 1
+            time.sleep(0.1)
+            
+    def stop(self):
+        self.is_running = False
+
 class VideoCompressor:
-    def __init__(self):
+    def __init__(self, config_file=None):
         self.check_ffmpeg()
+        self.quality_presets = {
+            'fast': {'preset': 'fast', 'crf': 28},
+            'medium': {'preset': 'medium', 'crf': 23},
+            'slow': {'preset': 'slow', 'crf': 20},
+            'high': {'preset': 'slower', 'crf': 18}
+        }
+        self.config = self.load_config(config_file)
+    
+    def load_config(self, config_file=None):
+        """設定ファイルを読み込み"""
+        if config_file is None:
+            # スクリプトと同じディレクトリのconfig.jsonを探す
+            script_dir = Path(__file__).parent
+            config_file = script_dir / "config.json"
+        
+        if Path(config_file).exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"{Colors.YELLOW}警告: 設定ファイル読み込みエラー - {e}{Colors.NC}")
+        
+        # デフォルト設定を返す
+        return {
+            "default_settings": {
+                "target_size_mb": 45,
+                "quality_preset": "medium",
+                "audio_bitrate": "128k"
+            },
+            "profiles": {}
+        }
+    
+    def get_profile_settings(self, profile_name):
+        """プロファイル設定を取得"""
+        if profile_name in self.config.get('profiles', {}):
+            profile = self.config['profiles'][profile_name]
+            return {
+                'target_size_mb': profile.get('target_size_mb', 45),
+                'quality_preset': profile.get('quality_preset', 'medium')
+            }
+        return None
     
     def check_ffmpeg(self):
         """ffmpegの存在確認"""
@@ -77,6 +156,14 @@ class VideoCompressor:
         """ffmpegを実行してプログレスを表示"""
         print(f"{Colors.YELLOW}{pass_name}...{Colors.NC}")
         
+        # プログレスバーを初期化
+        progress_bar = ProgressBar(duration)
+        
+        # アニメーションスレッドを開始
+        animation_thread = threading.Thread(target=progress_bar.animate_spinner)
+        animation_thread.daemon = True
+        animation_thread.start()
+        
         process = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE, 
@@ -85,7 +172,9 @@ class VideoCompressor:
         )
         
         # プログレス監視
+        stderr_lines = []
         for line in process.stderr:
+            stderr_lines.append(line)
             # 時間の進行を取得
             time_match = re.search(r'time=(\d+):(\d+):(\d+\.\d+)', line)
             if time_match:
@@ -94,20 +183,25 @@ class VideoCompressor:
                 seconds = float(time_match.group(3))
                 current_time = hours * 3600 + minutes * 60 + seconds
                 
-                if duration > 0:
-                    progress = min(current_time / duration * 100, 100)
-                    print(f"\r進行状況: {progress:.1f}%", end='', flush=True)
+                progress_bar.update_progress(current_time)
         
         process.wait()
-        print()  # 改行
+        
+        # アニメーションを停止
+        progress_bar.stop()
+        animation_thread.join(timeout=0.1)
+        
+        # 最終プログレスを表示
+        final_bar = progress_bar.draw_progress_bar(100)
+        print(f"\r{Colors.GREEN}✓{Colors.NC} {final_bar} 100.0% {Colors.GREEN}完了{Colors.NC}")
         
         if process.returncode != 0:
-            error_output = process.stderr.read() if process.stderr else "Unknown error"
+            error_output = '\n'.join(stderr_lines[-10:])  # 最後の10行のみ表示
             print(f"{Colors.RED}エラー: ffmpegの実行に失敗しました{Colors.NC}")
             print(f"Error details: {error_output}")
             sys.exit(1)
     
-    def compress_video(self, input_file, output_file, target_size_mb=45):
+    def compress_video(self, input_file, output_file, target_size_mb=45, quality_preset='medium'):
         """動画を圧縮"""
         input_path = Path(input_file)
         output_path = Path(output_file)
@@ -135,9 +229,13 @@ class VideoCompressor:
         duration = self.get_video_duration(video_info)
         print(f"{Colors.BLUE}動画の長さ:{Colors.NC} {duration:.2f}秒")
         
+        # 品質プリセットを取得
+        preset_config = self.quality_presets.get(quality_preset, self.quality_presets['medium'])
+        
         # 目標ビットレートを計算
         target_bitrate = self.calculate_target_bitrate(target_size_mb, duration)
         print(f"{Colors.BLUE}目標ビットレート:{Colors.NC} {target_bitrate}bps")
+        print(f"{Colors.BLUE}品質プリセット:{Colors.NC} {quality_preset} (preset: {preset_config['preset']}, crf: {preset_config['crf']})")
         
         print(f"{Colors.YELLOW}圧縮を開始しています...{Colors.NC}")
         
@@ -148,7 +246,7 @@ class VideoCompressor:
             '-c:v', 'libx264',
             '-b:v', str(target_bitrate),
             '-pass', '1',
-            '-preset', 'medium',
+            '-preset', preset_config['preset'],
             '-f', 'null',
             '/dev/null' if os.name != 'nt' else 'NUL'
         ]
@@ -161,7 +259,7 @@ class VideoCompressor:
             '-c:v', 'libx264',
             '-b:v', str(target_bitrate),
             '-pass', '2',
-            '-preset', 'medium',
+            '-preset', preset_config['preset'],
             '-c:a', 'aac',
             '-b:a', '128k',
             str(output_path)
@@ -189,6 +287,68 @@ class VideoCompressor:
             print(f"{Colors.GREEN}✅ Discordにアップロード可能です{Colors.NC}")
         else:
             print(f"{Colors.YELLOW}⚠️  まだ50MBを超えています。さらに圧縮が必要です{Colors.NC}")
+    
+    def batch_compress(self, input_directory, output_directory=None, target_size_mb=45, quality_preset='medium'):
+        """ディレクトリ内の全動画ファイルを一括圧縮"""
+        input_path = Path(input_directory)
+        
+        if not input_path.exists() or not input_path.is_dir():
+            print(f"{Colors.RED}エラー: ディレクトリ '{input_directory}' が見つかりません{Colors.NC}")
+            sys.exit(1)
+        
+        # 出力ディレクトリの設定
+        if output_directory is None:
+            output_path = input_path / "compressed"
+        else:
+            output_path = Path(output_directory)
+        
+        output_path.mkdir(exist_ok=True)
+        
+        # 動画ファイルの拡張子
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+        
+        # 動画ファイルを検索
+        video_files = [f for f in input_path.iterdir() 
+                      if f.is_file() and f.suffix.lower() in video_extensions]
+        
+        if not video_files:
+            print(f"{Colors.YELLOW}処理対象の動画ファイルが見つかりませんでした{Colors.NC}")
+            return
+        
+        print(f"{Colors.BLUE}バッチ処理開始:{Colors.NC} {len(video_files)}個のファイルを処理します")
+        print(f"{Colors.BLUE}入力ディレクトリ:{Colors.NC} {input_directory}")
+        print(f"{Colors.BLUE}出力ディレクトリ:{Colors.NC} {output_path}")
+        print()
+        
+        successful = 0
+        failed = 0
+        
+        for i, video_file in enumerate(video_files, 1):
+            print(f"{Colors.CYAN}[{i}/{len(video_files)}] 処理中: {video_file.name}{Colors.NC}")
+            
+            try:
+                output_file = output_path / f"{video_file.stem}_compressed.mp4"
+                
+                # すでに処理済みのファイルがある場合はスキップ
+                if output_file.exists():
+                    print(f"{Colors.YELLOW}スキップ: {output_file.name} は既に存在します{Colors.NC}")
+                    continue
+                
+                self.compress_video(str(video_file), str(output_file), target_size_mb, quality_preset)
+                successful += 1
+                print(f"{Colors.GREEN}✅ 完了: {output_file.name}{Colors.NC}")
+                
+            except Exception as e:
+                print(f"{Colors.RED}❌ エラー: {video_file.name} - {str(e)}{Colors.NC}")
+                failed += 1
+            
+            print("-" * 50)
+        
+        # 結果サマリー
+        print(f"{Colors.BLUE}バッチ処理完了{Colors.NC}")
+        print(f"{Colors.GREEN}成功: {successful}個{Colors.NC}")
+        if failed > 0:
+            print(f"{Colors.RED}失敗: {failed}個{Colors.NC}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -198,26 +358,78 @@ def main():
 例:
   python compress_video.py input.mov
   python compress_video.py input.mov output.mp4
-  python compress_video.py input.mov -s 300
+  python compress_video.py input.mov -s 300 -q slow
+  python compress_video.py --batch /path/to/videos -s 200
         """
     )
     
-    parser.add_argument('input_file', help='入力動画ファイル')
+    parser.add_argument('input_file', nargs='?', help='入力動画ファイル（バッチモード時はディレクトリ）')
     parser.add_argument('output_file', nargs='?', help='出力ファイル名（省略時は自動生成）')
     parser.add_argument('-s', '--size', type=int, default=45, 
                        help='目標サイズをMBで指定（デフォルト: 45MB）')
+    parser.add_argument('-q', '--quality', choices=['fast', 'medium', 'slow', 'high'], 
+                       default='medium', help='品質プリセット（デフォルト: medium）')
+    parser.add_argument('-p', '--profile', help='設定プロファイルを使用（discord, twitter, instagram, youtube_preview）')
+    parser.add_argument('--list-profiles', action='store_true', help='利用可能なプロファイルを表示')
+    parser.add_argument('--batch', action='store_true', 
+                       help='バッチモード: ディレクトリ内の全動画を一括処理')
+    parser.add_argument('-o', '--output-dir', help='バッチモード時の出力ディレクトリ')
     
     args = parser.parse_args()
     
-    # 出力ファイル名の生成
-    if not args.output_file:
-        input_path = Path(args.input_file)
-        stem = input_path.stem
-        args.output_file = f"{stem}_compressed.mp4"
-    
-    # 圧縮実行
     compressor = VideoCompressor()
-    compressor.compress_video(args.input_file, args.output_file, args.size)
+    
+    # プロファイル一覧表示
+    if args.list_profiles:
+        profiles = compressor.config.get('profiles', {})
+        if not profiles:
+            print(f"{Colors.YELLOW}設定プロファイルが見つかりません{Colors.NC}")
+        else:
+            print(f"{Colors.BLUE}利用可能なプロファイル:{Colors.NC}")
+            for name, profile in profiles.items():
+                desc = profile.get('description', '説明なし')
+                size = profile.get('target_size_mb', 'N/A')
+                quality = profile.get('quality_preset', 'N/A')
+                print(f"  {Colors.GREEN}{name}{Colors.NC}: {desc} (サイズ: {size}MB, 品質: {quality})")
+        sys.exit(0)
+    
+    if not args.input_file:
+        parser.print_help()
+        sys.exit(1)
+    
+    # プロファイル設定の適用
+    target_size = args.size
+    quality_preset = args.quality
+    
+    if args.profile:
+        profile_settings = compressor.get_profile_settings(args.profile)
+        if profile_settings:
+            target_size = profile_settings['target_size_mb']
+            quality_preset = profile_settings['quality_preset']
+            print(f"{Colors.BLUE}プロファイル '{args.profile}' を適用しました{Colors.NC}")
+        else:
+            print(f"{Colors.RED}エラー: プロファイル '{args.profile}' が見つかりません{Colors.NC}")
+            print("--list-profiles で利用可能なプロファイルを確認してください")
+            sys.exit(1)
+    
+    # バッチモード
+    if args.batch:
+        compressor.batch_compress(
+            args.input_file, 
+            args.output_dir, 
+            target_size, 
+            quality_preset
+        )
+    else:
+        # 単一ファイルモード
+        # 出力ファイル名の生成
+        if not args.output_file:
+            input_path = Path(args.input_file)
+            stem = input_path.stem
+            args.output_file = f"{stem}_compressed.mp4"
+        
+        # 圧縮実行
+        compressor.compress_video(args.input_file, args.output_file, target_size, quality_preset)
 
 if __name__ == '__main__':
     main()
